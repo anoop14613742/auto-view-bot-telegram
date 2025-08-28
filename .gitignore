@@ -1,0 +1,97 @@
+# Environment variables and sensitive configuration
+.env
+.env.local
+.env.production
+.env.staging
+*.env
+
+# Session files and user data
+sessions/
+sessions_*/
+*.session
+*.session-journal
+*.session-wal
+*.session-shm
+
+# State and runtime data
+state/
+bot.log
+*.log
+
+# User data and metadata
+*.json
+!.env.example
+!requirements.txt
+!package.json
+
+# Python cache and build files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+.env/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.backup
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Sensitive data patterns
+*password*
+*secret*
+*key*
+*token*
+*credentials*
+
+# Specific exclusions for this project
+sessions_artifacts/
+sessions_corrupted/
+sessions_frozen/
+f2f_data.json
+passwords.json
+sudo_users.json
+users.json
+auto_view_*.json
+health_state.json
