@@ -24,7 +24,7 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, BotCommand
 from aiogram.exceptions import (
     TelegramBadRequest, TelegramForbiddenError, TelegramNotFound,
     TelegramRetryAfter, TelegramAPIError
@@ -5030,6 +5030,28 @@ async def on_startup():
     # Start session monitoring task
     logger.info("🔍 Starting session monitoring...")
     asyncio.create_task(monitor_sessions())
+    
+    # Setup bot commands menu
+    logger.info("🤖 Setting up bot commands menu...")
+    try:
+        commands = [
+            BotCommand(command="start", description="🏠 Open main menu"),
+            BotCommand(command="info", description="ℹ️ Show bot info and stats"),
+            BotCommand(command="stats", description="📊 Show system statistics"),
+            BotCommand(command="login", description="🔐 Login helper for an account"),
+            BotCommand(command="sessions", description="📱 View loaded sessions"),
+            BotCommand(command="health", description="❤️ Check account health"),
+            BotCommand(command="auto_view", description="👁️ Setup auto-view channels"),
+            BotCommand(command="mega_auto", description="⚡ Bulk auto-view setup"),
+            BotCommand(command="view_stats", description="📈 View statistics"),
+            BotCommand(command="remove_account", description="🗑️ Remove an account"),
+            BotCommand(command="sudo", description="👑 Admin management"),
+            BotCommand(command="help", description="❓ Show help information")
+        ]
+        await bot.set_my_commands(commands)
+        logger.info("✅ Bot commands menu configured successfully")
+    except Exception as e:
+        logger.error(f"❌ Failed to setup bot commands: {e}")
     
     # Notify owners with detailed statistics
     stats = get_account_statistics()
