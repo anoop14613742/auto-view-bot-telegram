@@ -179,9 +179,13 @@ AUTO_DUAL_COUNTS = {}  # Dict to store count of accounts for auto-dual
 class AutoFeatureStates(StatesGroup):
     chat_id = State()
     count = State()  # Added for count-based operations
+    monthly_limit = State()  # Added for monthly limit setting
+    views_per_post = State()  # Added for views per post setting
 
 class MegaAutoFeatureStates(StatesGroup):
     chat_ids = State()
+    monthly_limit = State()  # Added for monthly limit setting
+    views_per_post = State()  # Added for views per post setting
     confirm = State()
 
 class AccountStates(StatesGroup):
@@ -209,6 +213,11 @@ class LoginHelperStates(StatesGroup):
 class PasswordManagementStates(StatesGroup):
     phone = State()
     password = State()
+
+class ChatLimitManagementStates(StatesGroup):
+    selecting_chat = State()
+    entering_new_limit = State()
+    entering_views_per_post = State()
 
 # Helper functions
 async def is_account_frozen_by_app_config(client):
@@ -807,6 +816,10 @@ def save_auto_chat_lists():
             json.dump(list(AUTO_VIEW_CHATS), f)
         with AUTO_VIEW_COUNTS_FILE.open('w') as f:
             json.dump({str(k): v for k, v in AUTO_VIEW_COUNTS.items()}, f)
+        
+        # Save views_core state including chat limits and views per post
+        views_core.save_all_state()
+        
         logger.info(f"Saved auto-view chat lists and counts")
     except Exception as e:
         logger.error(f"Failed to save auto chat lists: {e}")
@@ -1066,6 +1079,10 @@ async def auto_react_handler(event):
 _entity_error_logged = set()
 _MAX_ENTITY_ERROR_LOG_SIZE = 1000  # Cap to prevent memory growth
 
+# Global set to track processed messages and prevent duplicates
+_processed_messages = set()
+_MAX_PROCESSED_MESSAGES = 10000  # Cap to prevent memory growth
+
 def _add_entity_error_log(error_key):
     """Add error to logged set with size limiting."""
     global _entity_error_logged
@@ -1074,9 +1091,16 @@ def _add_entity_error_log(error_key):
         _entity_error_logged = set(list(_entity_error_logged)[_MAX_ENTITY_ERROR_LOG_SIZE//2:])
     _entity_error_logged.add(error_key)
 
+def _cleanup_processed_messages():
+    """Clean up processed messages set to prevent memory growth."""
+    global _processed_messages
+    if len(_processed_messages) >= _MAX_PROCESSED_MESSAGES:
+        # Keep only the newest half
+        _processed_messages = set(list(_processed_messages)[_MAX_PROCESSED_MESSAGES//2:])
+
 async def auto_view_handler(event):
     """Handle new messages for auto-view with comprehensive safety checks."""
-    global view_count, _entity_error_logged
+    global view_count, _entity_error_logged, _processed_messages
     
     if not auto_features_enabled:
         return
@@ -1085,6 +1109,16 @@ async def auto_view_handler(event):
     chat_id = event.chat_id
     if not is_auto_view_chat(chat_id):
         return  # Silently skip non-configured channels
+    
+    # SECOND: Prevent duplicate processing from multiple clients
+    message_key = f"{chat_id}:{event.message.id}"
+    if message_key in _processed_messages:
+        return  # Already processed this message
+    
+    # Mark message as processed and cleanup if needed
+    _processed_messages.add(message_key)
+    if len(_processed_messages) % 1000 == 0:  # Periodic cleanup
+        _cleanup_processed_messages()
     
     # Only log and process if this is a configured auto-view channel
     message_type = "Unknown"
@@ -1164,11 +1198,13 @@ async def auto_view_handler(event):
         if views_core.has_budget(phone, chat_id, today, hour_key):
             budget_filtered_clients.append((phone, client_obj))
         else:
-            logger.debug(f"Phone {phone} has no budget for chat {chat_id}, skipping")
+            logger.info(f"📊 Phone {phone} has no budget for chat {chat_id}, skipping")
     
     if not budget_filtered_clients:
-        logger.debug(f"No clients with budget for auto-view in chat {chat_id}")
+        logger.info(f"💸 No clients with budget for auto-view in chat {chat_id}")
         return
+    
+    logger.info(f"✅ {len(budget_filtered_clients)} clients with budget ready for auto-view in chat {chat_id}")
 
     async def process_view(phone, client_obj):
         global view_count  # Declare access to global view_count
@@ -1186,6 +1222,7 @@ async def auto_view_handler(event):
 
             if is_participant:
                 try:
+                    logger.debug(f"🔍 Attempting to send view from {phone} in chat {chat_id} for message {message_id}")
                     result = await views_core.add_views(client_obj, phone, chat_id, [message_id], label=f"views:{chat_id}")
                     if result.get("ok"):
                         # Consume budget on successful view
@@ -2146,7 +2183,8 @@ async def create_main_menu(user_id: int) -> InlineKeyboardMarkup:
     if user_id in OWNER_IDS or user_roles.get(user_id, {}).get('role') == 'co-owner':
         keyboard.append([InlineKeyboardButton(text="👥 Member Management", callback_data="member_management")])
         keyboard.append([InlineKeyboardButton(text="⚡ Auto Features", callback_data="auto_features")])
-        keyboard.append([InlineKeyboardButton(text="🔐 Login Helper", callback_data="login_helper")])  # New Login Helper button
+        keyboard.append([InlineKeyboardButton(text="� Budget Management", callback_data="budget_management")])
+        keyboard.append([InlineKeyboardButton(text="�🔐 Login Helper", callback_data="login_helper")])  # New Login Helper button
     
     # Add sudo access management for all users (permissions checked in handler)
     keyboard.append([InlineKeyboardButton(text="🔑 Sudo Access", callback_data="sudo_access")])
@@ -2260,6 +2298,16 @@ async def create_2fa_management_menu() -> InlineKeyboardMarkup:
     ]
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
+async def create_mega_auto_menu() -> InlineKeyboardMarkup:
+    """Create the mega auto-view setup menu."""
+    keyboard = [
+        [InlineKeyboardButton(text="⚡ Mega Auto-View", callback_data="mega_autoview")],
+        [InlineKeyboardButton(text="🗑️ Remove Mega Auto-View", callback_data="mega_removeautoview")],
+        [InlineKeyboardButton(text="📋 List Auto-View Chats", callback_data="list_autoview")],
+        [InlineKeyboardButton(text="🔙 Back", callback_data="auto_features")]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
 # Command handlers
 @dp.message(Command(commands=['start', 'help']))
 async def cmd_start(message: types.Message):
@@ -2313,6 +2361,479 @@ async def cmd_cancel(message: types.Message, state: FSMContext):
                     InlineKeyboardButton(text="🔙 Back", callback_data="main_menu")
                 ]])
             )
+
+@dp.message(Command('info'))
+async def info_command(message: types.Message):
+    """Show bot information and statistics."""
+    user_id = message.from_user.id
+    if user_id not in OWNER_IDS and user_roles.get(user_id, {}).get('role') != 'co-owner':
+        await message.reply("❌ Access denied.")
+        return
+    
+    stats = get_account_statistics()
+    info_text = (
+        f"🤖 **Telegram Meta Bot**\n\n"
+        f"📊 **System Statistics:**\n"
+        f"• Total Sessions: {stats['total']}\n"
+        f"• Active Accounts: {stats['active']}\n"
+        f"• Connected Active: {stats['connected_active']}\n"
+        f"• Frozen Accounts: {stats['frozen']}\n\n"
+        f"⚡ **Features:**\n"
+        f"• Auto-Views: {'Enabled' if auto_features_enabled else 'Disabled'}\n"
+        f"• Auto-View Chats: {len(AUTO_VIEW_CHATS)}\n"
+        f"• Session Monitoring: Active\n\n"
+        f"🔧 **Version:** 3.0.0\n"
+        f"⏰ **Uptime:** Active"
+    )
+    
+    await message.reply(
+        info_text,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="🔙 Back", callback_data="main_menu")
+        ]])
+    )
+
+@dp.message(Command('sessions'))
+async def sessions_command(message: types.Message):
+    """Show loaded sessions information."""
+    user_id = message.from_user.id
+    if user_id not in OWNER_IDS and user_roles.get(user_id, {}).get('role') != 'co-owner':
+        await message.reply("❌ Access denied.")
+        return
+    
+    if not user_clients:
+        await message.reply(
+            "📱 No sessions loaded.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="➕ Add Account", callback_data="add_account"),
+                InlineKeyboardButton(text="🔙 Back", callback_data="main_menu")
+            ]])
+        )
+        return
+    
+    sessions_text = "📱 **Loaded Sessions:**\n\n"
+    for i, (phone, (client, _)) in enumerate(user_clients.items(), 1):
+        status = "🟢 Connected" if client.is_connected() else "🔴 Disconnected"
+        frozen_status = "❄️ Frozen" if is_account_frozen(phone) else ""
+        sessions_text += f"{i}. `{phone}` {status} {frozen_status}\n"
+    
+    await message.reply(
+        sessions_text,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="🔄 Refresh", callback_data="sessions"),
+            InlineKeyboardButton(text="🔙 Back", callback_data="main_menu")
+        ]])
+    )
+
+@dp.message(Command('health'))
+async def health_command(message: types.Message):
+    """Check account health status."""
+    user_id = message.from_user.id
+    if user_id not in OWNER_IDS and user_roles.get(user_id, {}).get('role') != 'co-owner':
+        await message.reply("❌ Access denied.")
+        return
+    
+    if not user_clients:
+        await message.reply("📱 No sessions loaded.")
+        return
+    
+    health_text = "❤️ **Account Health Status:**\n\n"
+    healthy_count = 0
+    total_count = len(user_clients)
+    
+    for phone, (client, _) in user_clients.items():
+        if is_account_frozen(phone):
+            status = "❄️ Frozen"
+        elif not client.is_connected():
+            status = "🔴 Disconnected"
+        elif views_core.is_quarantined(phone):
+            status = "⚠️ Quarantined"
+        else:
+            status = "✅ Healthy"
+            healthy_count += 1
+        
+        health_text += f"• `{phone}`: {status}\n"
+    
+    health_text += f"\n📊 **Summary:** {healthy_count}/{total_count} accounts healthy"
+    
+    await message.reply(
+        health_text,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="🔄 Refresh", callback_data="health"),
+            InlineKeyboardButton(text="🔙 Back", callback_data="main_menu")
+        ]])
+    )
+
+@dp.message(Command('auto_view'))
+async def auto_view_command(message: types.Message, state: FSMContext):
+    """Setup auto-view channels."""
+    user_id = message.from_user.id
+    if user_id not in OWNER_IDS and user_roles.get(user_id, {}).get('role') != 'co-owner':
+        await message.reply("❌ Access denied.")
+        return
+    
+    await show_auto_view_menu(message)
+
+@dp.message(Command('mega_auto'))
+async def mega_auto_command(message: types.Message, state: FSMContext):
+    """Bulk auto-view setup."""
+    user_id = message.from_user.id
+    if user_id not in OWNER_IDS and user_roles.get(user_id, {}).get('role') != 'co-owner':
+        await message.reply("❌ Access denied.")
+        return
+    
+    await show_mega_auto_menu(message)
+
+@dp.message(Command('view_stats'))
+async def view_stats_command(message: types.Message):
+    """Show view statistics."""
+    user_id = message.from_user.id
+    if user_id not in OWNER_IDS and user_roles.get(user_id, {}).get('role') != 'co-owner':
+        await message.reply("❌ Access denied.")
+        return
+    
+    # Get today's date for stats
+    today = datetime.now().strftime("%Y-%m-%d")
+    
+    stats_text = f"📈 **View Statistics - {today}**\n\n"
+    
+    if not user_clients:
+        stats_text += "📱 No accounts loaded."
+    else:
+        total_views = 0
+        for phone in user_clients.keys():
+            phone_stats = views_core.get_usage_stats(phone, today, datetime.now().strftime("%Y%m%d%H"))
+            account_views = phone_stats['account']['usage']
+            total_views += account_views
+            if account_views > 0:
+                stats_text += f"• `{phone}`: {account_views} views\n"
+        
+        stats_text += f"\n🎯 **Total Views Today:** {total_views}\n"
+        stats_text += f"👁️ **Auto-View Chats:** {len(AUTO_VIEW_CHATS)}"
+    
+    await message.reply(
+        stats_text,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="🔄 Refresh", callback_data="view_stats"),
+            InlineKeyboardButton(text="🔙 Back", callback_data="main_menu")
+        ]])
+    )
+
+@dp.message(Command('reset_budget'))
+async def reset_budget_command(message: types.Message):
+    """Reset budget for all accounts."""
+    user_id = message.from_user.id
+    if user_id not in OWNER_IDS and user_roles.get(user_id, {}).get('role') != 'co-owner':
+        await message.reply("❌ Access denied.")
+        return
+    
+    # Reset all account daily usage
+    today = datetime.now().strftime("%Y-%m-%d")
+    hour_key = datetime.now().strftime("%Y%m%d%H")
+    
+    accounts_reset = 0
+    chats_reset = 0
+    
+    # Reset account budgets
+    for phone in list(views_core.account_daily_usage.keys()):
+        views_core.account_daily_usage[phone] = {"date": today, "count": 0}
+        accounts_reset += 1
+    
+    # Reset chat budgets  
+    for chat_id in list(views_core.chat_hour_usage.keys()):
+        views_core.chat_hour_usage[chat_id] = {"hour": hour_key, "count": 0}
+        chats_reset += 1
+    
+    # Save the reset state
+    views_core.save_all_state()
+    
+    await message.reply(
+        f"💰 **Budget Reset Complete!**\n\n"
+        f"🔄 Accounts reset: {accounts_reset}\n"
+        f"💬 Chats reset: {chats_reset}\n\n"
+        f"📊 **New Limits:**\n"
+        f"• Daily per account: {views_core.PER_ACCOUNT_DAILY_CAP:,} views\n"
+        f"• Hourly per chat: {views_core.PER_CHAT_HOURLY_CAP:,} views\n\n"
+        f"✅ All accounts can now send views again!"
+    )
+
+@dp.message(Command('budget_info'))
+async def budget_info_command(message: types.Message):
+    """Show current budget settings and usage."""
+    user_id = message.from_user.id
+    if user_id not in OWNER_IDS and user_roles.get(user_id, {}).get('role') != 'co-owner':
+        await message.reply("❌ Access denied.")
+        return
+    
+    today = datetime.now().strftime("%Y-%m-%d")
+    hour_key = datetime.now().strftime("%Y%m%d%H")
+    month_key = datetime.now().strftime("%Y-%m")
+    
+    info_text = f"💰 **Budget System Information**\n\n"
+    info_text += f"📊 **Current Limits:**\n"
+    daily_limit_text = "∞ (unlimited)" if views_core.PER_ACCOUNT_DAILY_CAP == 0 else f"{views_core.PER_ACCOUNT_DAILY_CAP:,}"
+    hourly_limit_text = "∞ (unlimited)" if views_core.PER_CHAT_HOURLY_CAP == 0 else f"{views_core.PER_CHAT_HOURLY_CAP:,}"
+    info_text += f"• Daily per account: {daily_limit_text} views\n"
+    info_text += f"• Hourly per chat: {hourly_limit_text} views\n\n"
+    
+    # Show chat-specific monthly limits and views per post
+    info_text += f"🎯 **Chat-Specific Settings:**\n"
+    chat_settings = []
+    for chat_id in views_core.PER_CHAT_MONTHLY_CAP.keys():
+        monthly_limit = views_core.get_chat_monthly_limit(chat_id)
+        views_per_post = views_core.get_chat_views_per_post(chat_id)
+        monthly_usage = views_core.chat_monthly_usage.get(chat_id, {}).get("count", 0)
+        monthly_limit_text = "∞" if monthly_limit == 0 else f"{monthly_limit:,}"
+        chat_settings.append((chat_id, monthly_limit_text, views_per_post, monthly_usage, monthly_limit))
+    
+    if chat_settings:
+        for chat_id, limit_text, views_per_post, usage, actual_limit in chat_settings:
+            usage_percent = f" ({usage}/{actual_limit})" if actual_limit > 0 else f" ({usage}/∞)"
+            info_text += f"• Chat `{chat_id}`: {limit_text}/month{usage_percent}, {views_per_post} views/post\n"
+    else:
+        info_text += "• No chat-specific settings configured\n"
+    
+    # Show top 10 accounts by usage
+    info_text += f"\n📈 **Top Account Usage Today ({today}):**\n"
+    account_usage = []
+    for phone, data in views_core.account_daily_usage.items():
+        if data.get("date") == today:
+            account_usage.append((phone, data["count"]))
+    
+    account_usage.sort(key=lambda x: x[1], reverse=True)
+    
+    if account_usage:
+        for i, (phone, count) in enumerate(account_usage[:10]):
+            if views_core.PER_ACCOUNT_DAILY_CAP > 0:
+                percentage = (count / views_core.PER_ACCOUNT_DAILY_CAP) * 100
+                info_text += f"• `{phone}`: {count:,}/{views_core.PER_ACCOUNT_DAILY_CAP:,} ({percentage:.1f}%)\n"
+            else:
+                info_text += f"• `{phone}`: {count:,}/∞\n"
+    else:
+        info_text += "• No usage recorded today\n"
+    
+    # Show chat usage this hour
+    info_text += f"\n💬 **Chat Usage This Hour ({hour_key}):**\n"
+    chat_usage = []
+    for chat_id, data in views_core.chat_hour_usage.items():
+        if data.get("hour") == hour_key:
+            chat_usage.append((chat_id, data["count"]))
+    
+    chat_usage.sort(key=lambda x: x[1], reverse=True)
+    
+    if chat_usage:
+        for chat_id, count in chat_usage[:5]:
+            if views_core.PER_CHAT_HOURLY_CAP > 0:
+                percentage = (count / views_core.PER_CHAT_HOURLY_CAP) * 100
+                info_text += f"• Chat `{chat_id}`: {count:,}/{views_core.PER_CHAT_HOURLY_CAP:,} ({percentage:.1f}%)\n"
+            else:
+                info_text += f"• Chat `{chat_id}`: {count:,}/∞\n"
+    else:
+        info_text += "• No usage recorded this hour\n"
+    
+    await message.reply(
+        info_text,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="🔄 Reset Budget", callback_data="reset_budget_confirm"),
+            InlineKeyboardButton(text="🔙 Back", callback_data="main_menu")
+        ]])
+    )
+
+@dp.message(Command('remove_account'))
+async def remove_account_command(message: types.Message, state: FSMContext):
+    """Remove an account."""
+    user_id = message.from_user.id
+    if user_id not in OWNER_IDS and user_roles.get(user_id, {}).get('role') != 'co-owner':
+        await message.reply("❌ Access denied.")
+        return
+    
+    await show_remove_account_menu(message, state)
+
+@dp.message(Command('sudo'))
+async def sudo_command(message: types.Message):
+    """Admin management."""
+    if message.from_user.id not in OWNER_IDS:
+        await message.reply("❌ Owner access required.")
+        return
+    
+    await show_sudo_menu(message)
+
+@dp.message(Command('chat_limits'))
+async def chat_limits_command(message: types.Message):
+    """Manage chat limits for auto-view."""
+    user_id = message.from_user.id
+    if user_id not in OWNER_IDS and user_roles.get(user_id, {}).get('role') != 'co-owner':
+        await message.reply("❌ Access denied.")
+        return
+    
+    # Get all auto-view chats
+    auto_view_chats = list(AUTO_VIEW_CHATS)
+    
+    if not auto_view_chats:
+        await message.reply(
+            "❌ **No Auto-View Chats Configured**\n\nYou need to set up auto-view for some chats first.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="🔙 Back to Main", callback_data="main_menu")
+            ]]),
+            parse_mode="Markdown"
+        )
+        return
+    
+    text = "⚙️ **Manage Chat Limits**\n\nSelect a chat to modify its limits:\n\n"
+    
+    keyboard = []
+    for chat_id in auto_view_chats:
+        monthly_limit = views_core.get_chat_monthly_limit(chat_id)
+        views_per_post = views_core.get_chat_views_per_post(chat_id)
+        monthly_usage = views_core.chat_monthly_usage.get(chat_id, {}).get("count", 0)
+        
+        limit_text = "∞" if monthly_limit == 0 else f"{monthly_limit:,}"
+        usage_text = f" ({monthly_usage})" if monthly_limit > 0 else f" ({monthly_usage}/∞)"
+        
+        text += f"• Chat `{chat_id}`: {limit_text}/month{usage_text}, {views_per_post} views/post\n"
+        
+        keyboard.append([InlineKeyboardButton(
+            text=f"📊 Chat {chat_id} - {limit_text}/month",
+            callback_data=f"edit_chat_limit_{chat_id}"
+        )])
+    
+    keyboard.append([InlineKeyboardButton(text="💰 Budget Management", callback_data="budget_management")])
+    keyboard.append([InlineKeyboardButton(text="🔙 Back to Main", callback_data="main_menu")])
+    
+    await message.reply(
+        text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),
+        parse_mode="Markdown"
+    )
+
+@dp.callback_query(lambda c: c.data == 'sessions')
+async def callback_sessions(callback_query: types.CallbackQuery):
+    """Handle sessions refresh callback."""
+    user_id = callback_query.from_user.id
+    if user_id not in OWNER_IDS and user_roles.get(user_id, {}).get('role') != 'co-owner':
+        await callback_query.answer("❌ Access denied.", show_alert=True)
+        return
+    
+    if not user_clients:
+        text = "📱 No sessions loaded."
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="➕ Add Account", callback_data="add_account"),
+            InlineKeyboardButton(text="🔙 Back", callback_data="main_menu")
+        ]])
+    else:
+        sessions_text = "📱 **Loaded Sessions:**\n\n"
+        for i, (phone, (client, _)) in enumerate(user_clients.items(), 1):
+            status = "🟢 Connected" if client.is_connected() else "🔴 Disconnected"
+            frozen_status = "❄️ Frozen" if is_account_frozen(phone) else ""
+            sessions_text += f"{i}. `{phone}` {status} {frozen_status}\n"
+        
+        text = sessions_text
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="🔄 Refresh", callback_data="sessions"),
+            InlineKeyboardButton(text="🔙 Back", callback_data="main_menu")
+        ]])
+    
+    await bot.edit_message_text(
+        chat_id=callback_query.message.chat.id,
+        message_id=callback_query.message.message_id,
+        text=text,
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
+    await callback_query.answer()
+
+@dp.callback_query(lambda c: c.data == 'health')
+async def callback_health(callback_query: types.CallbackQuery):
+    """Handle health refresh callback."""
+    user_id = callback_query.from_user.id
+    if user_id not in OWNER_IDS and user_roles.get(user_id, {}).get('role') != 'co-owner':
+        await callback_query.answer("❌ Access denied.", show_alert=True)
+        return
+    
+    if not user_clients:
+        text = "📱 No sessions loaded."
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="🔙 Back", callback_data="main_menu")
+        ]])
+    else:
+        health_text = "❤️ **Account Health Status:**\n\n"
+        healthy_count = 0
+        total_count = len(user_clients)
+        
+        for phone, (client, _) in user_clients.items():
+            if is_account_frozen(phone):
+                status = "❄️ Frozen"
+            elif not client.is_connected():
+                status = "🔴 Disconnected"
+            elif views_core.is_quarantined(phone):
+                status = "⚠️ Quarantined"
+            else:
+                status = "✅ Healthy"
+                healthy_count += 1
+            
+            health_text += f"• `{phone}`: {status}\n"
+        
+        health_text += f"\n📊 **Summary:** {healthy_count}/{total_count} accounts healthy"
+        text = health_text
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="🔄 Refresh", callback_data="health"),
+            InlineKeyboardButton(text="🔙 Back", callback_data="main_menu")
+        ]])
+    
+    await bot.edit_message_text(
+        chat_id=callback_query.message.chat.id,
+        message_id=callback_query.message.message_id,
+        text=text,
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
+    await callback_query.answer()
+
+@dp.callback_query(lambda c: c.data == 'view_stats')
+async def callback_view_stats(callback_query: types.CallbackQuery):
+    """Handle view stats refresh callback."""
+    user_id = callback_query.from_user.id
+    if user_id not in OWNER_IDS and user_roles.get(user_id, {}).get('role') != 'co-owner':
+        await callback_query.answer("❌ Access denied.", show_alert=True)
+        return
+    
+    # Get today's date for stats
+    today = datetime.now().strftime("%Y-%m-%d")
+    
+    stats_text = f"📈 **View Statistics - {today}**\n\n"
+    
+    if not user_clients:
+        stats_text += "📱 No accounts loaded."
+    else:
+        total_views = 0
+        for phone in user_clients.keys():
+            phone_stats = views_core.get_usage_stats(phone, today, datetime.now().strftime("%Y%m%d%H"))
+            account_views = phone_stats['account']['usage']
+            total_views += account_views
+            if account_views > 0:
+                stats_text += f"• `{phone}`: {account_views} views\n"
+        
+        stats_text += f"\n🎯 **Total Views Today:** {total_views}\n"
+        stats_text += f"👁️ **Auto-View Chats:** {len(AUTO_VIEW_CHATS)}"
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🔄 Refresh", callback_data="view_stats"),
+        InlineKeyboardButton(text="🔙 Back", callback_data="main_menu")
+    ]])
+    
+    await bot.edit_message_text(
+        chat_id=callback_query.message.chat.id,
+        message_id=callback_query.message.message_id,
+        text=stats_text,
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
+    await callback_query.answer()
 
 @dp.message(Command('addaccount'))
 async def cmd_add_account(message: types.Message, state: FSMContext):
@@ -2914,6 +3435,477 @@ async def callback_main_menu(callback_query: types.CallbackQuery):
     )
     await callback_query.answer()
 
+@dp.callback_query(lambda c: c.data == 'reset_budget_confirm')
+async def callback_reset_budget_confirm(callback_query: types.CallbackQuery):
+    """Handle budget reset confirmation."""
+    user_id = callback_query.from_user.id
+    if user_id not in OWNER_IDS and user_roles.get(user_id, {}).get('role') != 'co-owner':
+        await callback_query.answer("❌ Access denied.", show_alert=True)
+        return
+    
+    # Reset all account daily usage
+    today = datetime.now().strftime("%Y-%m-%d")
+    hour_key = datetime.now().strftime("%Y%m%d%H")
+    
+    accounts_reset = 0
+    chats_reset = 0
+    
+    # Reset account budgets
+    for phone in list(views_core.account_daily_usage.keys()):
+        views_core.account_daily_usage[phone] = {"date": today, "count": 0}
+        accounts_reset += 1
+    
+    # Reset chat budgets  
+    for chat_id in list(views_core.chat_hour_usage.keys()):
+        views_core.chat_hour_usage[chat_id] = {"hour": hour_key, "count": 0}
+        chats_reset += 1
+    
+    # Save the reset state
+    views_core.save_all_state()
+    
+    await bot.edit_message_text(
+        chat_id=callback_query.message.chat.id,
+        message_id=callback_query.message.message_id,
+        text=(
+            f"💰 **Budget Reset Complete!**\n\n"
+            f"🔄 Accounts reset: {accounts_reset}\n"
+            f"💬 Chats reset: {chats_reset}\n\n"
+            f"📊 **New Limits:**\n"
+            f"• Daily per account: {views_core.PER_ACCOUNT_DAILY_CAP:,} views\n"
+            f"• Hourly per chat: {views_core.PER_CHAT_HOURLY_CAP:,} views\n\n"
+            f"✅ All accounts can now send views again!"
+        ),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="🔙 Back to Main", callback_data="main_menu")
+        ]]),
+        parse_mode="Markdown"
+    )
+    await callback_query.answer("✅ Budget reset successfully!")
+
+@dp.callback_query(lambda c: c.data == 'budget_management')
+async def callback_budget_management(callback_query: types.CallbackQuery):
+    """Handle budget management callback."""
+    user_id = callback_query.from_user.id
+    if user_id not in OWNER_IDS and user_roles.get(user_id, {}).get('role') != 'co-owner':
+        await callback_query.answer("❌ Access denied.", show_alert=True)
+        return
+    
+    today = datetime.now().strftime("%Y-%m-%d")
+    hour_key = datetime.now().strftime("%Y%m%d%H")
+    
+    # Count accounts with budget
+    accounts_with_budget = 0
+    total_accounts = len(user_clients)
+    
+    for phone in user_clients.keys():
+        if views_core.has_budget(phone, -1002678962275, today, hour_key):  # Use sample chat for check
+            accounts_with_budget += 1
+    
+    text = (
+        f"💰 **Budget Management**\n\n"
+        f"📊 **Current Settings:**\n"
+        f"• Daily limit per account: {views_core.PER_ACCOUNT_DAILY_CAP:,} views\n"
+        f"• Hourly limit per chat: {views_core.PER_CHAT_HOURLY_CAP:,} views\n\n"
+        f"📱 **Account Status:**\n"
+        f"• Total accounts: {total_accounts}\n"
+        f"• Accounts with budget: {accounts_with_budget}\n"
+        f"• Accounts exhausted: {total_accounts - accounts_with_budget}\n\n"
+        f"🔧 **Actions:**"
+    )
+    
+    keyboard = [
+        [InlineKeyboardButton(text="📈 View Budget Info", callback_data="budget_info_menu")],
+        [InlineKeyboardButton(text="⚙️ Manage Chat Limits", callback_data="manage_chat_limits")],
+        [InlineKeyboardButton(text="🔄 Reset All Budget", callback_data="reset_budget_confirm")],
+        [InlineKeyboardButton(text="🔙 Back to Main", callback_data="main_menu")]
+    ]
+    
+    await bot.edit_message_text(
+        chat_id=callback_query.message.chat.id,
+        message_id=callback_query.message.message_id,
+        text=text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),
+        parse_mode="Markdown"
+    )
+    await callback_query.answer()
+
+@dp.callback_query(lambda c: c.data == 'manage_chat_limits')
+async def callback_manage_chat_limits(callback_query: types.CallbackQuery):
+    """Handle manage chat limits callback."""
+    user_id = callback_query.from_user.id
+    if user_id not in OWNER_IDS and user_roles.get(user_id, {}).get('role') != 'co-owner':
+        await callback_query.answer("❌ Access denied.", show_alert=True)
+        return
+    
+    # Get all auto-view chats
+    auto_view_chats = list(AUTO_VIEW_CHATS)
+    
+    if not auto_view_chats:
+        await bot.edit_message_text(
+            chat_id=callback_query.message.chat.id,
+            message_id=callback_query.message.message_id,
+            text="❌ **No Auto-View Chats Configured**\n\nYou need to set up auto-view for some chats first.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="🔙 Back to Budget", callback_data="budget_management")
+            ]]),
+            parse_mode="Markdown"
+        )
+        await callback_query.answer()
+        return
+    
+    text = "⚙️ **Manage Chat Limits**\n\nSelect a chat to modify its limits:\n\n"
+    
+    keyboard = []
+    for chat_id in auto_view_chats:
+        monthly_limit = views_core.get_chat_monthly_limit(chat_id)
+        views_per_post = views_core.get_chat_views_per_post(chat_id)
+        monthly_usage = views_core.chat_monthly_usage.get(chat_id, {}).get("count", 0)
+        
+        limit_text = "∞" if monthly_limit == 0 else f"{monthly_limit:,}"
+        usage_text = f" ({monthly_usage})" if monthly_limit > 0 else f" ({monthly_usage}/∞)"
+        
+        text += f"• Chat `{chat_id}`: {limit_text}/month{usage_text}, {views_per_post} views/post\n"
+        
+        keyboard.append([InlineKeyboardButton(
+            text=f"📊 Chat {chat_id} - {limit_text}/month",
+            callback_data=f"edit_chat_limit_{chat_id}"
+        )])
+    
+    keyboard.append([InlineKeyboardButton(text="🔙 Back to Budget", callback_data="budget_management")])
+    
+    await bot.edit_message_text(
+        chat_id=callback_query.message.chat.id,
+        message_id=callback_query.message.message_id,
+        text=text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),
+        parse_mode="Markdown"
+    )
+    await callback_query.answer()
+
+@dp.callback_query(lambda c: c.data.startswith('edit_chat_limit_'))
+async def callback_edit_chat_limit(callback_query: types.CallbackQuery):
+    """Handle editing a specific chat's limit."""
+    user_id = callback_query.from_user.id
+    if user_id not in OWNER_IDS and user_roles.get(user_id, {}).get('role') != 'co-owner':
+        await callback_query.answer("❌ Access denied.", show_alert=True)
+        return
+    
+    chat_id = int(callback_query.data.split('_')[-1])
+    
+    monthly_limit = views_core.get_chat_monthly_limit(chat_id)
+    views_per_post = views_core.get_chat_views_per_post(chat_id)
+    monthly_usage = views_core.chat_monthly_usage.get(chat_id, {}).get("count", 0)
+    
+    limit_text = "∞ (unlimited)" if monthly_limit == 0 else f"{monthly_limit:,}"
+    
+    text = (
+        f"📊 **Chat Limit Management**\n\n"
+        f"📍 **Chat ID:** `{chat_id}`\n"
+        f"💰 **Current Monthly Limit:** {limit_text}\n"
+        f"📈 **Current Usage:** {monthly_usage:,} views this month\n"
+        f"👁️ **Views Per Post:** {views_per_post}\n\n"
+        f"🔧 **Actions:**"
+    )
+    
+    keyboard = []
+    
+    # Monthly limit controls
+    if monthly_limit == 0:
+        keyboard.append([
+            InlineKeyboardButton(text="🔒 Set Monthly Limit", callback_data=f"set_monthly_limit_{chat_id}")
+        ])
+    else:
+        keyboard.append([
+            InlineKeyboardButton(text="⬆️ Increase (+1000)", callback_data=f"increase_limit_{chat_id}"),
+            InlineKeyboardButton(text="⬇️ Decrease (-1000)", callback_data=f"decrease_limit_{chat_id}")
+        ])
+        keyboard.append([
+            InlineKeyboardButton(text="🔓 Remove Limit", callback_data=f"remove_limit_{chat_id}"),
+            InlineKeyboardButton(text="✏️ Set Custom", callback_data=f"set_monthly_limit_{chat_id}")
+        ])
+    
+    # Views per post controls
+    keyboard.append([
+        InlineKeyboardButton(text="📊 Change Views/Post", callback_data=f"set_views_per_post_{chat_id}")
+    ])
+    
+    # Reset usage
+    if monthly_usage > 0:
+        keyboard.append([
+            InlineKeyboardButton(text="🔄 Reset Usage", callback_data=f"reset_usage_{chat_id}")
+        ])
+    
+    keyboard.append([
+        InlineKeyboardButton(text="🔙 Back to Chat List", callback_data="manage_chat_limits")
+    ])
+    
+    await bot.edit_message_text(
+        chat_id=callback_query.message.chat.id,
+        message_id=callback_query.message.message_id,
+        text=text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),
+        parse_mode="Markdown"
+    )
+    await callback_query.answer()
+
+@dp.callback_query(lambda c: c.data.startswith('increase_limit_'))
+async def callback_increase_limit(callback_query: types.CallbackQuery):
+    """Handle increasing a chat's monthly limit."""
+    user_id = callback_query.from_user.id
+    if user_id not in OWNER_IDS and user_roles.get(user_id, {}).get('role') != 'co-owner':
+        await callback_query.answer("❌ Access denied.", show_alert=True)
+        return
+    
+    chat_id = int(callback_query.data.split('_')[-1])
+    current_limit = views_core.get_chat_monthly_limit(chat_id)
+    
+    new_limit = current_limit + 1000
+    views_core.set_chat_monthly_limit(chat_id, new_limit)
+    
+    await callback_query.answer(f"✅ Monthly limit increased to {new_limit:,} views")
+    
+    # Refresh the chat limit page
+    await callback_edit_chat_limit(callback_query)
+
+@dp.callback_query(lambda c: c.data.startswith('decrease_limit_'))
+async def callback_decrease_limit(callback_query: types.CallbackQuery):
+    """Handle decreasing a chat's monthly limit."""
+    user_id = callback_query.from_user.id
+    if user_id not in OWNER_IDS and user_roles.get(user_id, {}).get('role') != 'co-owner':
+        await callback_query.answer("❌ Access denied.", show_alert=True)
+        return
+    
+    chat_id = int(callback_query.data.split('_')[-1])
+    current_limit = views_core.get_chat_monthly_limit(chat_id)
+    
+    new_limit = max(0, current_limit - 1000)  # Don't go below 0
+    views_core.set_chat_monthly_limit(chat_id, new_limit)
+    
+    if new_limit == 0:
+        await callback_query.answer("✅ Monthly limit removed (unlimited)")
+    else:
+        await callback_query.answer(f"✅ Monthly limit decreased to {new_limit:,} views")
+    
+    # Refresh the chat limit page
+    await callback_edit_chat_limit(callback_query)
+
+@dp.callback_query(lambda c: c.data.startswith('remove_limit_'))
+async def callback_remove_limit(callback_query: types.CallbackQuery):
+    """Handle removing a chat's monthly limit."""
+    user_id = callback_query.from_user.id
+    if user_id not in OWNER_IDS and user_roles.get(user_id, {}).get('role') != 'co-owner':
+        await callback_query.answer("❌ Access denied.", show_alert=True)
+        return
+    
+    chat_id = int(callback_query.data.split('_')[-1])
+    views_core.set_chat_monthly_limit(chat_id, 0)
+    
+    await callback_query.answer("✅ Monthly limit removed (unlimited)")
+    
+    # Refresh the chat limit page
+    await callback_edit_chat_limit(callback_query)
+
+@dp.callback_query(lambda c: c.data.startswith('reset_usage_'))
+async def callback_reset_usage(callback_query: types.CallbackQuery):
+    """Handle resetting a chat's monthly usage."""
+    user_id = callback_query.from_user.id
+    if user_id not in OWNER_IDS and user_roles.get(user_id, {}).get('role') != 'co-owner':
+        await callback_query.answer("❌ Access denied.", show_alert=True)
+        return
+    
+    chat_id = int(callback_query.data.split('_')[-1])
+    
+    # Reset the monthly usage for this chat
+    month_key = datetime.now().strftime("%Y-%m")
+    views_core.chat_monthly_usage[chat_id] = {"month": month_key, "count": 0}
+    
+    await callback_query.answer("✅ Monthly usage reset to 0")
+    
+    # Refresh the chat limit page
+    await callback_edit_chat_limit(callback_query)
+
+@dp.callback_query(lambda c: c.data.startswith('set_monthly_limit_'))
+async def callback_set_monthly_limit(callback_query: types.CallbackQuery, state: FSMContext):
+    """Handle setting a custom monthly limit."""
+    user_id = callback_query.from_user.id
+    if user_id not in OWNER_IDS and user_roles.get(user_id, {}).get('role') != 'co-owner':
+        await callback_query.answer("❌ Access denied.", show_alert=True)
+        return
+    
+    chat_id = int(callback_query.data.split('_')[-1])
+    current_limit = views_core.get_chat_monthly_limit(chat_id)
+    
+    await state.set_state(ChatLimitManagementStates.entering_new_limit)
+    await state.update_data(chat_id=chat_id)
+    
+    limit_text = "unlimited" if current_limit == 0 else f"{current_limit:,}"
+    
+    await bot.edit_message_text(
+        chat_id=callback_query.message.chat.id,
+        message_id=callback_query.message.message_id,
+        text=(
+            f"✏️ **Set Monthly Limit**\n\n"
+            f"📍 **Chat ID:** `{chat_id}`\n"
+            f"💰 **Current Limit:** {limit_text} views/month\n\n"
+            f"Enter the new monthly limit (0 for unlimited):"
+        ),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="❌ Cancel", callback_data=f"edit_chat_limit_{chat_id}")
+        ]]),
+        parse_mode="Markdown"
+    )
+    await callback_query.answer()
+
+@dp.callback_query(lambda c: c.data.startswith('set_views_per_post_'))
+async def callback_set_views_per_post(callback_query: types.CallbackQuery, state: FSMContext):
+    """Handle setting views per post."""
+    user_id = callback_query.from_user.id
+    if user_id not in OWNER_IDS and user_roles.get(user_id, {}).get('role') != 'co-owner':
+        await callback_query.answer("❌ Access denied.", show_alert=True)
+        return
+    
+    chat_id = int(callback_query.data.split('_')[-1])
+    current_views = views_core.get_chat_views_per_post(chat_id)
+    
+    await state.set_state(ChatLimitManagementStates.entering_views_per_post)
+    await state.update_data(chat_id=chat_id)
+    
+    await bot.edit_message_text(
+        chat_id=callback_query.message.chat.id,
+        message_id=callback_query.message.message_id,
+        text=(
+            f"📊 **Set Views Per Post**\n\n"
+            f"📍 **Chat ID:** `{chat_id}`\n"
+            f"👁️ **Current Setting:** {current_views} views per post\n\n"
+            f"Enter the new views per post (1 to {len(user_clients)}):"
+        ),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="❌ Cancel", callback_data=f"edit_chat_limit_{chat_id}")
+        ]]),
+        parse_mode="Markdown"
+    )
+    await callback_query.answer()
+
+@dp.message(ChatLimitManagementStates.entering_new_limit)
+async def process_new_monthly_limit(message: types.Message, state: FSMContext):
+    """Process the new monthly limit input."""
+    try:
+        new_limit = int(message.text.strip())
+        if new_limit < 0:
+            await message.reply("❌ Invalid limit. Please enter 0 for unlimited or a positive number.")
+            return
+        
+        data = await state.get_data()
+        chat_id = data['chat_id']
+        
+        views_core.set_chat_monthly_limit(chat_id, new_limit)
+        
+        limit_text = "unlimited" if new_limit == 0 else f"{new_limit:,}"
+        await message.reply(
+            f"✅ **Monthly Limit Updated**\n\n"
+            f"📍 Chat `{chat_id}`: {limit_text} views/month",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="🔙 Back to Chat", callback_data=f"edit_chat_limit_{chat_id}")
+            ]]),
+            parse_mode="Markdown"
+        )
+        await state.clear()
+        
+    except ValueError:
+        await message.reply("❌ Invalid limit. Please enter a valid integer (0 for unlimited).")
+
+@dp.message(ChatLimitManagementStates.entering_views_per_post)
+async def process_new_views_per_post(message: types.Message, state: FSMContext):
+    """Process the new views per post input."""
+    try:
+        new_views = int(message.text.strip())
+        if not (1 <= new_views <= len(user_clients)):
+            await message.reply(f"❌ Invalid views per post. Please enter a number between 1 and {len(user_clients)}.")
+            return
+        
+        data = await state.get_data()
+        chat_id = data['chat_id']
+        
+        views_core.set_chat_views_per_post(chat_id, new_views)
+        
+        await message.reply(
+            f"✅ **Views Per Post Updated**\n\n"
+            f"📍 Chat `{chat_id}`: {new_views} views per post",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="🔙 Back to Chat", callback_data=f"edit_chat_limit_{chat_id}")
+            ]]),
+            parse_mode="Markdown"
+        )
+        await state.clear()
+        
+    except ValueError:
+        await message.reply("❌ Invalid views per post. Please enter a valid integer.")
+
+@dp.callback_query(lambda c: c.data == 'budget_info_menu')
+async def callback_budget_info_menu(callback_query: types.CallbackQuery):
+    """Handle budget info menu callback."""
+    user_id = callback_query.from_user.id
+    if user_id not in OWNER_IDS and user_roles.get(user_id, {}).get('role') != 'co-owner':
+        await callback_query.answer("❌ Access denied.", show_alert=True)
+        return
+    
+    today = datetime.now().strftime("%Y-%m-%d")
+    hour_key = datetime.now().strftime("%Y%m%d%H")
+    
+    info_text = f"💰 **Budget System Information**\n\n"
+    info_text += f"📊 **Current Limits:**\n"
+    info_text += f"• Daily per account: {views_core.PER_ACCOUNT_DAILY_CAP:,} views\n"
+    info_text += f"• Hourly per chat: {views_core.PER_CHAT_HOURLY_CAP:,} views\n\n"
+    
+    # Show top 10 accounts by usage
+    info_text += f"📈 **Top Account Usage Today ({today}):**\n"
+    account_usage = []
+    for phone, data in views_core.account_daily_usage.items():
+        if data.get("date") == today:
+            account_usage.append((phone, data["count"]))
+    
+    account_usage.sort(key=lambda x: x[1], reverse=True)
+    
+    if account_usage:
+        for i, (phone, count) in enumerate(account_usage[:10]):
+            if views_core.PER_ACCOUNT_DAILY_CAP > 0:
+                percentage = (count / views_core.PER_ACCOUNT_DAILY_CAP) * 100
+                info_text += f"• `{phone}`: {count:,}/{views_core.PER_ACCOUNT_DAILY_CAP:,} ({percentage:.1f}%)\n"
+            else:
+                info_text += f"• `{phone}`: {count:,}/∞\n"
+    else:
+        info_text += "• No usage recorded today\n"
+    
+    # Show chat usage this hour
+    info_text += f"\n💬 **Chat Usage This Hour ({hour_key}):**\n"
+    chat_usage = []
+    for chat_id, data in views_core.chat_hour_usage.items():
+        if data.get("hour") == hour_key:
+            chat_usage.append((chat_id, data["count"]))
+    
+    chat_usage.sort(key=lambda x: x[1], reverse=True)
+    
+    if chat_usage:
+        for chat_id, count in chat_usage[:5]:
+            if views_core.PER_CHAT_HOURLY_CAP > 0:
+                percentage = (count / views_core.PER_CHAT_HOURLY_CAP) * 100
+                info_text += f"• Chat `{chat_id}`: {count:,}/{views_core.PER_CHAT_HOURLY_CAP:,} ({percentage:.1f}%)\n"
+            else:
+                info_text += f"• Chat `{chat_id}`: {count:,}/∞\n"
+    else:
+        info_text += "• No usage recorded this hour\n"
+    
+    await bot.edit_message_text(
+        chat_id=callback_query.message.chat.id,
+        message_id=callback_query.message.message_id,
+        text=info_text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="🔙 Back to Budget", callback_data="budget_management")
+        ]]),
+        parse_mode="Markdown"
+    )
+    await callback_query.answer()
+
 @dp.callback_query(lambda c: c.data == 'account_management')
 async def callback_account_management(callback_query: types.CallbackQuery):
     """Handle account management menu callback."""
@@ -3079,6 +4071,63 @@ async def callback_auto_react_menu(callback_query: types.CallbackQuery):
 async def callback_auto_react_features(callback_query: types.CallbackQuery):
     """Handle all auto-react feature callbacks - feature removed."""
     await callback_query.answer("🚧 Auto-react feature has been removed from this bot version.", show_alert=True)
+
+async def show_auto_view_menu(message):
+    """Show auto-view management menu."""
+    keyboard = await create_auto_view_menu()
+    await message.reply(
+        "👁️ **Auto-View Management**\n\nConfigure automatic message views:",
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
+
+async def show_mega_auto_menu(message):
+    """Show mega auto-view setup menu."""
+    keyboard = await create_mega_auto_menu()
+    await message.reply(
+        "⚡ **Mega Auto-View Setup**\n\nBulk configure auto-view for multiple chats:",
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
+
+async def show_remove_account_menu(message, state):
+    """Show remove account menu."""
+    if not user_clients:
+        await message.reply(
+            "📱 No accounts to remove.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="🔙 Back", callback_data="main_menu")
+            ]])
+        )
+        return
+    
+    await state.set_state(RemoveAccountStates.phone)
+    accounts_text = "🗑️ **Remove Account**\n\nEnter the phone number of the account to remove:\n\n"
+    for i, phone in enumerate(user_clients.keys(), 1):
+        accounts_text += f"{i}. `{phone}`\n"
+    
+    await message.reply(
+        accounts_text,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="❌ Cancel", callback_data="cancel_removeaccount")
+        ]])
+    )
+
+async def show_sudo_menu(message):
+    """Show sudo management menu."""
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Add Sudo User", callback_data="add_sudo_user")],
+        [InlineKeyboardButton(text="🗑️ Remove Sudo User", callback_data="remove_sudo_user")],
+        [InlineKeyboardButton(text="📋 List Sudo Users", callback_data="list_sudo_users")],
+        [InlineKeyboardButton(text="🔙 Back", callback_data="main_menu")]
+    ])
+    
+    await message.reply(
+        "👑 **Sudo Management**\n\nManage administrative users:",
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
 
 @dp.callback_query(lambda c: c.data == 'auto_view_menu')
 async def callback_auto_view_menu(callback_query: types.CallbackQuery):
@@ -4141,19 +5190,34 @@ async def process_auto_feature_count(message: types.Message, state: FSMContext):
         chat_id = data['chat_id']
         feature_type = data['feature_type']
         
+        # Update state data with count
+        await state.update_data(count=count)
+        
+        # For view features, ask for monthly limit
+        if feature_type == 'view':
+            await state.set_state(AutoFeatureStates.monthly_limit)
+            await message.reply(
+                f"💰 **Monthly Limit Setting**\n\n"
+                f"Please set the monthly view limit for chat `{chat_id}`.\n"
+                f"Enter `0` for unlimited views, or a positive number for the limit:",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="Cancel", callback_data="cancel_auto_feature_setup")
+                ]]),
+                parse_mode="Markdown"
+            )
+            return
+        
+        # For non-view features, complete setup directly
         target_set = {
             'react': AUTO_REACT_CHATS,
-            'view': AUTO_VIEW_CHATS,
             'dual': AUTO_DUAL_CHATS
         }[feature_type]
         set_count_func = {
             'react': set_auto_react_count,
-            'view': set_auto_view_count,
             'dual': set_auto_dual_count
         }[feature_type]
         feature_name = {
             'react': 'Auto-React',
-            'view': 'Auto-View',
             'dual': 'Auto-Dual'
         }[feature_type]
 
@@ -4173,6 +5237,104 @@ async def process_auto_feature_count(message: types.Message, state: FSMContext):
     except ValueError:
         await message.reply(
             "❌ Invalid count. Please enter a valid integer.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="Cancel", callback_data="cancel_auto_feature_setup")
+            ]])
+        )
+
+@dp.message(AutoFeatureStates.monthly_limit)
+async def process_auto_feature_monthly_limit(message: types.Message, state: FSMContext):
+    """Process the monthly limit for auto-view."""
+    try:
+        monthly_limit = int(message.text.strip())
+        if monthly_limit < 0:
+            await message.reply(
+                "❌ Invalid monthly limit. Please enter 0 for unlimited or a positive number.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="Cancel", callback_data="cancel_auto_feature_setup")
+                ]])
+            )
+            return
+
+        data = await state.get_data()
+        chat_id = data['chat_id']
+        
+        # Update state data with monthly limit
+        await state.update_data(monthly_limit=monthly_limit)
+        
+        # Ask for views per post
+        await state.set_state(AutoFeatureStates.views_per_post)
+        limit_text = "unlimited" if monthly_limit == 0 else str(monthly_limit)
+        await message.reply(
+            f"📊 **Views Per Post Setting**\n\n"
+            f"Monthly limit set to: **{limit_text}** views\n\n"
+            f"Now, please specify how many views you want per post in chat `{chat_id}`.\n"
+            f"Enter a number between 1 and {len(user_clients)} (available accounts):",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="Cancel", callback_data="cancel_auto_feature_setup")
+            ]]),
+            parse_mode="Markdown"
+        )
+
+    except ValueError:
+        await message.reply(
+            "❌ Invalid monthly limit. Please enter a valid integer (0 for unlimited).",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="Cancel", callback_data="cancel_auto_feature_setup")
+            ]])
+        )
+
+@dp.message(AutoFeatureStates.views_per_post)
+async def process_auto_feature_views_per_post(message: types.Message, state: FSMContext):
+    """Process the views per post for auto-view."""
+    try:
+        views_per_post = int(message.text.strip())
+        if not (1 <= views_per_post <= len(user_clients)):
+            await message.reply(
+                f"❌ Invalid views per post. Please enter a number between 1 and {len(user_clients)} (available accounts).",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="Cancel", callback_data="cancel_auto_feature_setup")
+                ]])
+            )
+            return
+
+        data = await state.get_data()
+        chat_id = data['chat_id']
+        count = data['count']
+        monthly_limit = data['monthly_limit']
+        
+        # Set up auto-view with all parameters
+        AUTO_VIEW_CHATS.add(chat_id)
+        set_auto_view_count(chat_id, count)
+        
+        # Set monthly limit if specified
+        if monthly_limit > 0:
+            from views_core import set_chat_monthly_limit
+            set_chat_monthly_limit(chat_id, monthly_limit)
+        
+        # Store views per post setting
+        from views_core import set_chat_views_per_post
+        set_chat_views_per_post(chat_id, views_per_post)
+        save_auto_chat_lists()
+        
+        limit_text = "unlimited" if monthly_limit == 0 else str(monthly_limit)
+        await message.reply(
+            f"✅ **Auto-View Setup Complete!**\n\n"
+            f"📍 Chat ID: `{chat_id}`\n"
+            f"👥 Accounts: `{count}`\n"
+            f"💰 Monthly limit: **{limit_text}** views\n"
+            f"📊 Views per post: **{views_per_post}** views\n\n"
+            f"Auto-View is now active for this chat!",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="🔙 Back to Auto Features", callback_data="auto_features")
+            ]]),
+            parse_mode="Markdown"
+        )
+        await state.clear()
+
+    except ValueError:
+        await message.reply(
+            "❌ Invalid views per post. Please enter a valid integer.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
                 InlineKeyboardButton(text="Cancel", callback_data="cancel_auto_feature_setup")
             ]])
@@ -4203,21 +5365,37 @@ async def process_mega_auto_feature_chat_ids(message: types.Message, state: FSMC
 
     data = await state.get_data()
     action = data.get('action', data.get('feature_type'))  # Handle both feature_type and action
+    
+    # Update state data with chat IDs
+    await state.update_data(chat_ids=valid_chat_ids)
 
-    if action in ['react', 'view', 'dual']:
+    # For view features, ask for monthly limit
+    if action == 'view':
+        await state.set_state(MegaAutoFeatureStates.monthly_limit)
+        await message.reply(
+            f"💰 **Monthly Limit Setting**\n\n"
+            f"Chat IDs: {', '.join(map(str, valid_chat_ids))}\n\n"
+            f"Please set the monthly view limit for these chats.\n"
+            f"Enter `0` for unlimited views, or a positive number for the limit:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="Cancel", callback_data="cancel_auto_feature_setup")
+            ]]),
+            parse_mode="Markdown"
+        )
+        return
+
+    # For non-view features, complete setup directly
+    if action in ['react', 'dual']:
         target_set = {
             'react': AUTO_REACT_CHATS,
-            'view': AUTO_VIEW_CHATS,
             'dual': AUTO_DUAL_CHATS
         }[action]
         set_count_func = {
             'react': set_auto_react_count,
-            'view': set_auto_view_count,
             'dual': set_auto_dual_count
         }[action]
         feature_name = {
             'react': 'Auto-React',
-            'view': 'Auto-View',
             'dual': 'Auto-Dual'
         }[action]
 
@@ -4233,6 +5411,7 @@ async def process_mega_auto_feature_chat_ids(message: types.Message, state: FSMC
             ]]),
             parse_mode="Markdown"
         )
+        await state.clear()
 
     elif action in ['remove_mega_react', 'remove_mega_view', 'remove_mega_dual']:
         target_set = {
@@ -4277,6 +5456,106 @@ async def process_mega_auto_feature_chat_ids(message: types.Message, state: FSMC
         )
 
     await state.clear()
+
+@dp.message(MegaAutoFeatureStates.monthly_limit)
+async def process_mega_auto_feature_monthly_limit(message: types.Message, state: FSMContext):
+    """Process the monthly limit for mega auto-view."""
+    try:
+        monthly_limit = int(message.text.strip())
+        if monthly_limit < 0:
+            await message.reply(
+                "❌ Invalid monthly limit. Please enter 0 for unlimited or a positive number.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="Cancel", callback_data="cancel_auto_feature_setup")
+                ]])
+            )
+            return
+
+        data = await state.get_data()
+        chat_ids = data['chat_ids']
+        
+        # Update state data with monthly limit
+        await state.update_data(monthly_limit=monthly_limit)
+        
+        # Ask for views per post
+        await state.set_state(MegaAutoFeatureStates.views_per_post)
+        limit_text = "unlimited" if monthly_limit == 0 else str(monthly_limit)
+        await message.reply(
+            f"📊 **Views Per Post Setting**\n\n"
+            f"Chat IDs: {', '.join(map(str, chat_ids))}\n"
+            f"Monthly limit set to: **{limit_text}** views\n\n"
+            f"Now, please specify how many views you want per post in these chats.\n"
+            f"Enter a number between 1 and {len(user_clients)} (available accounts):",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="Cancel", callback_data="cancel_auto_feature_setup")
+            ]]),
+            parse_mode="Markdown"
+        )
+
+    except ValueError:
+        await message.reply(
+            "❌ Invalid monthly limit. Please enter a valid integer (0 for unlimited).",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="Cancel", callback_data="cancel_auto_feature_setup")
+            ]])
+        )
+
+@dp.message(MegaAutoFeatureStates.views_per_post)
+async def process_mega_auto_feature_views_per_post(message: types.Message, state: FSMContext):
+    """Process the views per post for mega auto-view."""
+    try:
+        views_per_post = int(message.text.strip())
+        if not (1 <= views_per_post <= len(user_clients)):
+            await message.reply(
+                f"❌ Invalid views per post. Please enter a number between 1 and {len(user_clients)} (available accounts).",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="Cancel", callback_data="cancel_auto_feature_setup")
+                ]])
+            )
+            return
+
+        data = await state.get_data()
+        chat_ids = data['chat_ids']
+        monthly_limit = data['monthly_limit']
+        
+        # Set up mega auto-view with all parameters
+        for chat_id in chat_ids:
+            AUTO_VIEW_CHATS.add(chat_id)
+            set_auto_view_count(chat_id, len(user_clients))  # Use all accounts for mega actions
+            
+            # Set monthly limit if specified
+            if monthly_limit > 0:
+                from views_core import set_chat_monthly_limit
+                set_chat_monthly_limit(chat_id, monthly_limit)
+            
+            # Store views per post setting
+            from views_core import set_chat_views_per_post
+            set_chat_views_per_post(chat_id, views_per_post)
+        
+        save_auto_chat_lists()
+        
+        limit_text = "unlimited" if monthly_limit == 0 else str(monthly_limit)
+        await message.reply(
+            f"✅ **Mega Auto-View Setup Complete!**\n\n"
+            f"📍 Chat IDs: {', '.join(map(str, chat_ids))}\n"
+            f"👥 Accounts: **All accounts** ({len(user_clients)})\n"
+            f"💰 Monthly limit: **{limit_text}** views per chat\n"
+            f"📊 Views per post: **{views_per_post}** views\n\n"
+            f"Mega Auto-View is now active for all specified chats!",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="🔙 Back to Auto Features", callback_data="auto_features")
+            ]]),
+            parse_mode="Markdown"
+        )
+        await state.clear()
+
+    except ValueError:
+        await message.reply(
+            "❌ Invalid views per post. Please enter a valid integer.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="Cancel", callback_data="cancel_auto_feature_setup")
+            ]])
+        )
 
 @dp.callback_query(lambda c: c.data == 'cancel_auto_feature_setup')
 async def callback_cancel_auto_feature_setup(callback_query: types.CallbackQuery, state: FSMContext):
@@ -4532,6 +5811,9 @@ async def callback_help(callback_query: types.CallbackQuery):
         "- `/listaccounts`: List all loaded accounts (sudo users only)\n"
         "- `/removeaccount`: Remove an account (owners only)\n"
         "- `/info`: Show bot statistics and account info (owners/co-owners only)\n"
+        "- `/view_stats`: Show view statistics for all accounts\n"
+        "- `/reset_budget`: Reset budget for all accounts\n"
+        "- `/budget_info`: Show detailed budget information\n"
         "- `/megareact <chat_id> <message_id> [emoji]`: Make all accounts react to a message (owners/co-owners only)\n"
         "- `/listsudo`: List sudo users (owners/co-owners only)\n"
         "- `/cancel`: Cancel an ongoing operation\n"
@@ -4545,6 +5827,7 @@ async def callback_help(callback_query: types.CallbackQuery):
             "- **Account Management**: Add, remove, and list accounts\n"
             "- **Member Management**: Join/leave groups or channels with multiple accounts\n"
             "- **Auto Features**: Configure automatic reactions and views for specific chats\n"
+            "- **Budget Management**: Monitor and control view limits with smart quotas\n"
             "- **Sudo Access**: Manage privileged users (co-owners and admins)\n"
             "- **Login Helper**: Assist with logging into accounts elsewhere\n"
             "  - Automatically detect and display OTP codes\n"
@@ -4885,29 +6168,32 @@ async def callback_cancel_member_management(callback_query: types.CallbackQuery,
 
 # Error handler
 @dp.errors()
-async def error_handler(update, exception):
+async def error_handler(event):
     """Handle errors globally."""
-    logger.error(f"Update caused error: {exception}")
+    logger.error(f"Update caused error: {event.exception}")
     try:
-        if isinstance(exception, TelegramRetryAfter):
-            await asyncio.sleep(exception.retry_after)
+        if isinstance(event.exception, TelegramRetryAfter):
+            await asyncio.sleep(event.exception.retry_after)
             return True  # Retry the update
-        elif isinstance(exception, TelegramForbiddenError):
+        elif isinstance(event.exception, TelegramForbiddenError):
             try:
+                update = event.update
                 chat_id = update.message.chat.id if hasattr(update, 'message') and update.message else update.callback_query.message.chat.id
                 await bot.send_message(chat_id, "❌ Bot was blocked or kicked from the chat. Please check permissions.")
             except:
                 pass  # Ignore if we can't send the message
-        elif isinstance(exception, TelegramNotFound):
+        elif isinstance(event.exception, TelegramNotFound):
             try:
+                update = event.update
                 chat_id = update.message.chat.id if hasattr(update, 'message') and update.message else update.callback_query.message.chat.id
                 await bot.send_message(chat_id, "❌ Resource not found. Please check the chat ID or message ID.")
             except:
                 pass  # Ignore if we can't send the message
         else:
             try:
+                update = event.update
                 chat_id = update.message.chat.id if hasattr(update, 'message') and update.message else update.callback_query.message.chat.id
-                await bot.send_message(chat_id, f"❌ An error occurred: {str(exception)}")
+                await bot.send_message(chat_id, f"❌ An error occurred: {str(event.exception)}")
             except:
                 pass  # Ignore if we can't send the message
     except Exception as e:
